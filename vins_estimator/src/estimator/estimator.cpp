@@ -15,7 +15,84 @@ Estimator::Estimator(): f_manager{Rs}
     ROS_INFO("init begins");
     initThreadFlag = false;
     clearState();
-}
+
+    package_path = ros::package::getPath("vins");
+    std::string config_path = (boost::filesystem::path(package_path) / "model_config" / "models.yaml").string();
+    YAML::Node config = YAML::LoadFile(config_path);
+    std::string segmentation_model_path = (boost::filesystem::path(package_path) / "models" / config["model_name"].as<std::string>() ).string();
+    unetModel = new UnetInferece(config, segmentation_model_path);
+
+    std::string svm_model_path = ""; 
+    if(config["use_svm_filter"].as<int>()){
+        svm_model_path = (boost::filesystem::path(package_path) / "models" / config["svm_filename"].as<std::string>() ).string();
+        if(!boost::filesystem::exists(svm_model_path)){
+            svm_model_path = "";
+        }
+    }
+    featureTracker = new FeatureTracker(svm_model_path, config["use_svm_filter"].as<int>());
+
+    config_path = (boost::filesystem::path(package_path).parent_path() / "config" / "realsense_d435i" / "realsense_stereo_imu_config.yaml").string();
+    YAML::Node vins_config = YAML::LoadFile(config_path);
+    calibrate_via_arucos = vins_config["aruco_markers"]["usage"].as<int>();
+    ground_features_refinement = vins_config["ground_features_refinement"].as<int>();
+    f_manager.ground_features_refinement = ground_features_refinement;
+    std::vector<float> weights = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+    fitter = new GroundPlaneFitter(200, 100, weights);
+    vins2world_tf_calculator.setWorldGround(0.0,0.0,1.0,0.0);
+
+    if(!calibrate_via_arucos){
+        config_path = (boost::filesystem::path(package_path).parent_path() / "config" / "ground_plane_params.yaml").string();
+        YAML::Node ground_config = YAML::LoadFile(config_path);
+        if(ground_config["ground_plane_parameters"]["usage"].as<int>()){
+            vins_ground_a = ground_config["ground_plane_parameters"]["a"].as<double>();
+            vins_ground_b = ground_config["ground_plane_parameters"]["b"].as<double>();
+            vins_ground_c = ground_config["ground_plane_parameters"]["c"].as<double>();
+            vins_ground_d = ground_config["ground_plane_parameters"]["d"].as<double>();
+            Eigen::Vector3d origin_vins;
+            double z = -vins_ground_d/vins_ground_c;
+            origin_vins(0) = 0;
+            origin_vins(1) = 0;
+            origin_vins(2) = z;
+            f_manager.setGroundPlane(vins_ground_a, vins_ground_b, vins_ground_c, origin_vins);
+            f_manager.ground_plane_initialized = true;
+        }
+
+        vins2world_tf_calculator.setVinsGround(vins_ground_a,vins_ground_b,vins_ground_c,vins_ground_d);
+        
+        YAML::Node aruco_config = vins_config["aruco_markers"]["arucos"];
+        cam2world_tf_calculator = new cam2world(aruco_config);
+        
+        ros::Time::init();
+        start_time = ros::Time::now();
+
+
+        config_path = (boost::filesystem::path(package_path).parent_path() / "config" / "realsense_d435i" / "left.yaml").string();
+        YAML::Node camera_config = YAML::LoadFile(config_path);
+        float fx = camera_config["projection_parameters"]["fx"].as<float>();
+        float fy = camera_config["projection_parameters"]["fy"].as<float>();
+        float cx = camera_config["projection_parameters"]["cx"].as<float>();
+        float cy = camera_config["projection_parameters"]["cy"].as<float>();
+        // float intrinsics_data[9] = {fx, 0.0, cx, 0.0, fy, cy, 0.0,0.0,1.0};
+        intrinsics_coef = cv::Mat::zeros(3, 3, CV_64F);
+        intrinsics_coef.at<double>(0, 0) = fx;
+        intrinsics_coef.at<double>(1, 1) = fy;
+        intrinsics_coef.at<double>(0, 2) = cx;
+        intrinsics_coef.at<double>(1, 2) = cy;
+        intrinsics_coef.at<double>(2, 2) = 1.0;
+
+        float k1 = camera_config["distortion_parameters"]["k1"].as<float>();
+        float k2 = camera_config["distortion_parameters"]["k2"].as<float>();
+        float p1 = camera_config["distortion_parameters"]["p1"].as<float>();
+        float p2 = camera_config["distortion_parameters"]["p2"].as<float>();
+        distortion_coef = cv::Mat::zeros(1, 5, CV_64F);
+        distortion_coef.at<double>(0, 0) = k1;
+        distortion_coef.at<double>(0, 1) = k2;
+        distortion_coef.at<double>(0, 2) = p1;
+        distortion_coef.at<double>(0, 3) = p2;
+        distortion_coef.at<double>(0, 4) = 0;
+    }
+
+}   
 
 Estimator::~Estimator()
 {
@@ -24,6 +101,50 @@ Estimator::~Estimator()
         processThread.join();
         printf("join thread \n");
     }
+    datafile1.close();
+    datafile2.close();
+    datafile3.close();
+}
+
+void Estimator::setDataFileName(float w, int refinement){
+    if(refinement >= 0){
+        ground_features_refinement = refinement;
+        f_manager.ground_features_refinement = refinement;
+    }
+    std::string file1_tmp = "data1_" + std::to_string(w) + "_" + std::to_string(refinement) +"autoadjust.txt";
+    std::string file2_tmp = "data2_" + std::to_string(w) + "_" + std::to_string(refinement) +"autoadjust.txt";
+    std::string file3_tmp = "fuzzy_output_" + std::to_string(refinement) +"_.txt";
+
+    std::string file1 = (boost::filesystem::path(package_path) / "data" / file1_tmp).string();
+    std::string file2 = (boost::filesystem::path(package_path) / "data" / file2_tmp).string();
+    std::string file3 = (boost::filesystem::path(package_path) / "data" / file3_tmp).string();
+
+    datafile1.open(file1);
+    datafile2.open(file2);
+    datafile3.open(file3);
+}
+
+void Estimator::publishGroundPlane(){
+    std::vector<std::vector<double>> pts;
+    std::vector<double> tmp(3,0);
+    Eigen::Vector3d current_pose = Ps[frame_count];
+    tmp[0] = -20 + current_pose(0);
+    tmp[1] = -20 + current_pose(1);
+    tmp[2] = -(tmp[0]*vins_ground_a + tmp[1]*vins_ground_b+vins_ground_d)/vins_ground_c;
+    pts.push_back(tmp);
+    tmp[0] = -20 + current_pose(0);
+    tmp[1] = 20 + current_pose(1);
+    tmp[2] = -(tmp[0]*vins_ground_a + tmp[1]*vins_ground_b+vins_ground_d)/vins_ground_c;
+    pts.push_back(tmp);
+    tmp[0] = 20 + current_pose(0);
+    tmp[1] = 20 + current_pose(1);
+    tmp[2] = -(tmp[0]*vins_ground_a + tmp[1]*vins_ground_b+vins_ground_d)/vins_ground_c;
+    pts.push_back(tmp);
+    tmp[0] = 20 + current_pose(0);
+    tmp[1] = -20 + current_pose(1);
+    tmp[2] = -(tmp[0]*vins_ground_a + tmp[1]*vins_ground_b+vins_ground_d)/vins_ground_c;
+    pts.push_back(tmp);
+    pubGroundPlane(pts);
 }
 
 void Estimator::clearState()
@@ -33,9 +154,15 @@ void Estimator::clearState()
         accBuf.pop();
     while(!gyrBuf.empty())
         gyrBuf.pop();
-    while(!featureBuf.empty())
+    while(!featureBuf.empty()){
         featureBuf.pop();
-
+    }
+    while(!feature_indicators_maps.empty()){
+        feature_indicators_maps.pop();
+    }
+    while(!camworld_poses.empty()){
+        camworld_poses.pop();
+    }
     prevTime = -1;
     curTime = 0;
     openExEstimation = 0;
@@ -108,7 +235,7 @@ void Estimator::setParameter()
     td = TD;
     g = G;
     cout << "set g " << g.transpose() << endl;
-    featureTracker.readIntrinsicParameter(CAM_NAMES);
+    featureTracker->readIntrinsicParameter(CAM_NAMES);
 
     std::cout << "MULTIPLE_THREAD is " << MULTIPLE_THREAD << '\n';
     if (MULTIPLE_THREAD && !initThreadFlag)
@@ -163,24 +290,66 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
     map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
     TicToc featureTrackerTime;
 
+    int half_rows = int(_img.rows/2);
+    cv::Point p1(0,half_rows);
+    cv::Point p2(_img.cols, _img.rows);
+    cv::Rect crop_region(p1.x, p1.y,p2.x-p1.x, p2.y-p1.y);
+
+    if(GROUND_SEGMENTATION){
+        segmentation_count ++;
+        if (segmentation_count >= SEGMENTATION_FRAME_PERIOD){
+            //pass through onnx model() -> cv::Mat
+            //dummy ground mask...
+
+            segmentation_mask = cv::Mat(_img.rows, _img.cols, CV_8UC1, cv::Scalar(0));
+            // cv::rectangle(segmentation_mask, p1, p2, 255 ,-1);
+            // std::cout << _img.rows << " " <<  _img.cols << " " << model_output.rows << " " << model_output.cols << "\n";
+            cv::Mat croppedImage = _img(crop_region);
+            cv::Mat model_output = unetModel->getSegmentedClass(croppedImage);
+
+            for(int i=0; i < model_output.rows; i++)
+            {
+                for(int j = 0; j < model_output.cols; j++){
+                    int pixel_class = model_output.at<uint8_t>(cv::Point(j,i));
+                    segmentation_mask.at<uint8_t>(cv::Point(j,i+half_rows)) = colors.at(pixel_class);
+                }
+            }
+            //---
+
+            cv::Mat out;
+            cv::addWeighted( _img, 0.5, segmentation_mask, 0.5, 0.0, out);
+            pubSegmentedImage(out, t);
+            segmentation_count = 0;
+        }
+    }
     if(_img1.empty())
-        featureFrame = featureTracker.trackImage(t, _img);
+        featureFrame = featureTracker->trackImage(t, _img);
     else
-        featureFrame = featureTracker.trackImage(t, _img, _img1);
+        featureFrame = featureTracker->trackImage(t, _img, _img1, segmentation_mask);
+
+    segmentation_mask.release();
+    map<int,bool> feature_indicators_map = featureTracker->featureids_isground;
     //printf("featureTracker time: %f\n", featureTrackerTime.toc());
 
     if (SHOW_TRACK)
     {
-        cv::Mat imgTrack = featureTracker.getTrackImage();
+        cv::Mat imgTrack = featureTracker->getTrackImage();
         pubTrackImage(imgTrack, t);
     }
-    
+
     if(MULTIPLE_THREAD)  
     {     
         if(inputImageCnt % 2 == 0)
         {
             mBuf.lock();
             featureBuf.push(make_pair(t, featureFrame));
+            feature_indicators_maps.push(feature_indicators_map);
+            Eigen::Matrix4d out;
+            if(!cam2world_tf_calculator->calcPose(_img, intrinsics_coef, distortion_coef, out)){
+                out(3,3) = 0.0;
+            }
+            
+            camworld_poses.push(out);
             mBuf.unlock();
         }
     }
@@ -188,6 +357,13 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
     {
         mBuf.lock();
         featureBuf.push(make_pair(t, featureFrame));
+        feature_indicators_maps.push(feature_indicators_map);
+        Eigen::Matrix4d out;
+        if(!cam2world_tf_calculator->calcPose(_img, intrinsics_coef, distortion_coef, out)){
+            out(3,3) = 0.0;
+        }
+        camworld_poses.push(out);
+
         mBuf.unlock();
         TicToc processTime;
         processMeasurements();
@@ -217,6 +393,9 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
 {
     mBuf.lock();
     featureBuf.push(make_pair(t, featureFrame));
+    Eigen::Matrix4d out;
+    out(3,3) = 0.0;
+    camworld_poses.push(out);
     mBuf.unlock();
 
     if(!MULTIPLE_THREAD)
@@ -232,6 +411,7 @@ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::
         printf("not receive imu\n");
         return false;
     }
+    
     //printf("get imu from %f %f\n", t0, t1);
     //printf("imu fornt time %f   imu end time %f\n", accBuf.front().first, accBuf.back().first);
     if(t1 <= accBuf.back().first)
@@ -274,9 +454,39 @@ void Estimator::processMeasurements()
         //printf("process measurments\n");
         pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > feature;
         vector<pair<double, Eigen::Vector3d>> accVector, gyrVector;
+        map<int,bool> feature_indicators_map;
         if(!featureBuf.empty())
         {
+            Eigen::Matrix4d leftcam2world;
+            if(!camworld_poses.empty()){
+                leftcam2world = camworld_poses.front();  
+                if ((leftcam2world(3,3) > 0.5)){
+
+                    Eigen::Matrix3d rotmat1 = leftcam2world.block<3,3>(0,0);
+                    Eigen::Vector3d euler_angles1 = rotmat1.eulerAngles(2, 1, 0);
+
+                    Eigen::Matrix4d vins_pose = Eigen::Matrix4d::Identity();
+                    vins_pose.block<3,3>(0,0) = Rs[WINDOW_SIZE]*ric[0];
+                    vins_pose.block<3,1>(0,3) = Ps[WINDOW_SIZE] + Rs[WINDOW_SIZE]*tic[0];
+                    if(!vins2world_tf_calculator.received_first)
+                        vins2world_tf_calculator.calcT(leftcam2world, vins_pose);
+                    
+                    Eigen::Matrix4d cam2world_estimated = vins2world_tf_calculator.T_vins2world_first_*vins_pose;
+                    Eigen::Matrix3d rotmat2 = cam2world_estimated.block<3,3>(0,0);
+                    Eigen::Vector3d euler_angles2 = rotmat2.eulerAngles(2, 1, 0);
+
+                    double t_interval = (ros::Time::now() - start_time).toSec();
+                    std::cout << "writing data " << t_interval << "\n";
+
+                    datafile1 << t_interval << "," << leftcam2world(0,3) << "," << leftcam2world(1,3) << "," << leftcam2world(2,3) << "," << euler_angles1(2) << "," << euler_angles1(1) << "," << euler_angles1(0) << std::endl;
+                    datafile2 << t_interval << "," << cam2world_estimated(0,3) << "," << cam2world_estimated(1,3) << "," << cam2world_estimated(2,3) << "," << euler_angles2(2) << "," << euler_angles2(1) << "," << euler_angles2(0) << std::endl;
+                    row_num++;
+                }
+                camworld_poses.pop();
+            }
+
             feature = featureBuf.front();
+            feature_indicators_map = feature_indicators_maps.front();
             curTime = feature.first + td;
             while(1)
             {
@@ -294,8 +504,6 @@ void Estimator::processMeasurements()
             mBuf.lock();
             if(USE_IMU)
                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
-
-            featureBuf.pop();
             mBuf.unlock();
 
             if(USE_IMU)
@@ -315,13 +523,64 @@ void Estimator::processMeasurements()
                 }
             }
             mProcess.lock();
-            processImage(feature.second, feature.first);
+            processImage(feature.second, feature.first, feature_indicators_map);
             prevTime = curTime;
 
+            featureBuf.pop();
+            feature_indicators_maps.pop();
+
+            if(ground_features_refinement){
+                bool stop_criteria = (leftcam2world(3,0) < 0);
+                bool new_plane_receive = (leftcam2world(3,3) > 0);
+                if(calibrate_via_arucos){
+                    if(stop_criteria){
+                        set_groundplane_static = true;
+                        publishGroundPlane();
+                    }
+                    else if(!set_groundplane_static && new_plane_receive && !f_manager.ground_features_fit_plane){
+                        Eigen::Matrix4d cam2lcam = Eigen::Matrix4d::Identity();
+                        cam2lcam.block<3,3>(0,0) = ric[0].transpose();
+                        cam2lcam.block<3,1>(0,3) = -ric[0].transpose()*tic[0];
+                        Eigen::Matrix4d cam2world = leftcam2world*cam2lcam;
+                        
+                        Eigen::Matrix4d vins_pose = Eigen::Matrix4d::Identity();
+                        vins_pose.block<3,3>(0,0) = Rs[WINDOW_SIZE];
+                        vins_pose.block<3,1>(0,3) = Ps[WINDOW_SIZE];
+                        vins2world_tf_calculator.calcT(cam2world, vins_pose);
+                        Eigen::Vector3d vec_ = vins2world_tf_calculator.plane_vec_vins_;
+                        vins_ground_a = vec_(0);
+                        vins_ground_b = vec_(1);
+                        vins_ground_c = vec_(2);
+                        vins_ground_d = vins2world_tf_calculator.d_vins_;
+                        std::vector<float> refined_params = fitter->InsertGroundPlane(vins_ground_a, vins_ground_b, vins_ground_c, vins_ground_d);
+                        vins_ground_a = refined_params.at(0);
+                        vins_ground_b = refined_params.at(1);
+                        vins_ground_c = refined_params.at(2);
+                        vins_ground_d = refined_params.at(3);
+                        std::cout << "aruco fitted plane: (a,b,c,d) " << vins_ground_a << ", " << vins_ground_b << ", "<< vins_ground_c << ", "<< vins_ground_d << "\n";
+                        Eigen::Vector3d origin_vins;
+                        double z = -vins_ground_d/vins_ground_c;
+                        origin_vins(0) = 0;
+                        origin_vins(1) = 0;
+                        origin_vins(2) = z;
+                        f_manager.setGroundPlane(vins_ground_a ,vins_ground_b,vins_ground_c,origin_vins);
+
+                        publishGroundPlane();
+                    }
+                }
+
+                else{
+                    if(!set_groundplane_static){
+                        set_groundplane_static = true;
+                        publishGroundPlane();
+                    }
+                }
+            }
+           
             printStatistics(*this, 0);
 
             std_msgs::Header header;
-            header.frame_id = "world";
+            header.frame_id = "vins";
             header.stamp = ros::Time(feature.first);
 
             pubOdometry(*this, header);
@@ -339,6 +598,42 @@ void Estimator::processMeasurements()
         std::chrono::milliseconds dura(2);
         std::this_thread::sleep_for(dura);
     }
+}
+
+void Estimator::refineGroundPlane(){
+    std::vector<float> means, stddevs;
+    std::vector<bool> keeps;
+    std::vector<float> tmp_vec = {vins_ground_a, vins_ground_b, vins_ground_c};
+    float tmp_d = vins_ground_d;
+    if(tmp_vec.at(2) < 0){
+        for (unsigned long i = 0; i < tmp_vec.size(); i++) {
+            tmp_vec[i] *= -1;
+        }
+        tmp_d *= -1;
+    }
+    history_ground_planes_vec.push_back(tmp_vec);
+    history_ground_planes_d.push_back(tmp_d);
+
+    std::vector<float> mean_vec;
+    float mean = 0;
+    float sum = 0;
+    for (int i = 0; i < int(history_ground_planes_vec[0].size()); i++) {
+        sum = 0;
+        for (int j = 0; j < int(history_ground_planes_vec.size()); j++) {
+            sum += history_ground_planes_vec[j][i];
+        }
+        mean = sum / history_ground_planes_vec.size();
+        mean_vec.push_back(mean);
+    }
+
+    sum = 0;
+    for (int i = 0; i < int(history_ground_planes_d.size()); i++) {
+        sum += history_ground_planes_d[i];
+    }
+    vins_ground_d = sum / history_ground_planes_d.size();
+    vins_ground_a = mean_vec[0];
+    vins_ground_b = mean_vec[1];
+    vins_ground_c = mean_vec[2];
 }
 
 
@@ -408,7 +703,7 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
     gyr_0 = angular_velocity; 
 }
 
-void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header)
+void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header, const map<int, bool> ground_indicators)
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
@@ -511,7 +806,6 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             f_manager.initFramePoseByPnP(frame_count, Ps, Rs, tic, ric);
             f_manager.triangulate(frame_count, Ps, Rs, tic, ric);
             optimization();
-
             if(frame_count == WINDOW_SIZE)
             {
                 optimization();
@@ -532,13 +826,55 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             Bas[frame_count] = Bas[prev_frame];
             Bgs[frame_count] = Bgs[prev_frame];
         }
-
+        last_sample_time_ = ros::Time::now();
+        last_pos_ = Ps[frame_count];
     }
     else
     {
+        f_manager.groundFeatureAssignment(frame_count, ground_indicators);
+        if(ground_features_refinement){
+            std::set<int> rejectGroundIds;
+            for (auto &it_per_id : f_manager.feature)
+            {
+                int index = frame_count- it_per_id.start_frame;
+                if((int)it_per_id.feature_per_frame.size() >= index + 1){
+                    if (it_per_id.estimated_depth > 0 && it_per_id.is_ground){
+                        Vector3d ptsInCam = ric[0] * (it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth) + tic[0];
+                        Vector3d ptsInWorld = Rs[it_per_id.start_frame] * ptsInCam + Ps[it_per_id.start_frame];
+                        fitter->InsertVinsPoint(it_per_id.feature_id, ptsInWorld);
+                        // pubRefineFeature(ptsInWorld);                
+                    }
+                }
+            }
+            Eigen::Vector4d plane_coef;
+            if(fitter->fitPlane(plane_coef)){
+                f_manager.ground_plane_initialized = true;
+                f_manager.ground_features_fit_plane = true;
+                vins_ground_a = plane_coef(0);
+                vins_ground_b = plane_coef(1);
+                vins_ground_c = plane_coef(2);
+                vins_ground_d = plane_coef(3);
+                std::vector<float> refined_params = fitter->InsertGroundPlane(vins_ground_a, vins_ground_b, vins_ground_c, vins_ground_d);
+                vins_ground_a = refined_params.at(0);
+                vins_ground_b = refined_params.at(1);
+                vins_ground_c = refined_params.at(2);
+                vins_ground_d = refined_params.at(3); 
+                std::cout << "feature fitted plane: (a,b,c,d) " << vins_ground_a << ", " << vins_ground_b << ", "<< vins_ground_c << ", "<< vins_ground_d << "\n";               
+                double z = -vins_ground_d/vins_ground_c;
+                Eigen::Vector3d plane_origin = {0,0,z};
+                f_manager.setGroundPlane(vins_ground_a, vins_ground_b, vins_ground_c, plane_origin);
+                publishGroundPlane();
+            }
+
+            f_manager.groundFeatureAlignment(Ps, Rs, tic, ric, rejectGroundIds, 10);
+            featureTracker->falseGroundFeatures(rejectGroundIds);
+        }
+
         TicToc t_solve;
         if(!USE_IMU)
             f_manager.initFramePoseByPnP(frame_count, Ps, Rs, tic, ric);
+
+
         f_manager.triangulate(frame_count, Ps, Rs, tic, ric);
         optimization();
         set<int> removeIndex;
@@ -546,7 +882,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         f_manager.removeOutlier(removeIndex);
         if (! MULTIPLE_THREAD)
         {
-            featureTracker.removeOutliers(removeIndex);
+            featureTracker->removeOutliers(removeIndex);
             predictPtsInNextFrame();
         }
             
@@ -560,6 +896,29 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             setParameter();
             ROS_WARN("system reboot!");
             return;
+        }
+
+        ros::Time cur_time = ros::Time::now();
+        double time_interval = (cur_time-last_sample_time_).toSec();
+
+        if(time_interval > sampling_time_){
+            int nums=0;
+            for(auto &el:ground_indicators){
+                if(el.second)
+                    nums++;
+            }
+
+            double dx = Ps[frame_count](0) - last_pos_(0);
+            double dy = Ps[frame_count](1) - last_pos_(1);
+            double dz = Ps[frame_count](2) - last_pos_(2);
+            double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            // speed_MA.add_value(dist/time_interval);
+            double speed = dist/time_interval;
+            GROUND_WEIGHTAGE = weight_adjustor_.getWeightage(speed,(double)nums);
+            std::cout << "[weight_adjustor] " << speed << ", " << nums<< " -> " << GROUND_WEIGHTAGE << "\n";
+            datafile3 << speed << ", " << nums << ", " << GROUND_WEIGHTAGE << std::endl;
+            last_sample_time_=cur_time;
+            last_pos_ = Ps[frame_count];
         }
 
         slideWindow();
@@ -1008,8 +1367,12 @@ void Estimator::optimization()
 
     ceres::Problem problem;
     ceres::LossFunction *loss_function;
+    ceres::LossFunction *feature_loss_function;
+    ceres::LossFunction *loss_function_chosen;
     //loss_function = NULL;
     loss_function = new ceres::HuberLoss(1.0);
+    feature_loss_function = new Weighted_HuberLoss(1.0, GROUND_WEIGHTAGE);
+    loss_function_chosen = loss_function;
     //loss_function = new ceres::CauchyLoss(1.0 / FOCAL_LENGTH);
     //ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
     for (int i = 0; i < frame_count + 1; i++)
@@ -1075,6 +1438,10 @@ void Estimator::optimization()
         
         Vector3d pts_i = it_per_id.feature_per_frame[0].point;
 
+        loss_function_chosen = loss_function;
+        if(it_per_id.is_ground){
+            loss_function_chosen = feature_loss_function;
+        }
         for (auto &it_per_frame : it_per_id.feature_per_frame)
         {
             imu_j++;
@@ -1083,7 +1450,9 @@ void Estimator::optimization()
                 Vector3d pts_j = it_per_frame.point;
                 ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+
+
+                problem.AddResidualBlock(f_td, loss_function_chosen, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
             }
 
             if(STEREO && it_per_frame.is_stereo)
@@ -1093,13 +1462,13 @@ void Estimator::optimization()
                 {
                     ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                    problem.AddResidualBlock(f, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
+                    problem.AddResidualBlock(f, loss_function_chosen, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
                 }
                 else
                 {
                     ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                    problem.AddResidualBlock(f, loss_function, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
+                    problem.AddResidualBlock(f, loss_function_chosen, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
                 }
                
             }
@@ -1186,7 +1555,12 @@ void Estimator::optimization()
                     continue;
 
                 Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-
+                
+                loss_function_chosen = loss_function;
+                if(it_per_id.is_ground){
+                    loss_function_chosen = feature_loss_function;
+                }
+            
                 for (auto &it_per_frame : it_per_id.feature_per_frame)
                 {
                     imu_j++;
@@ -1195,7 +1569,7 @@ void Estimator::optimization()
                         Vector3d pts_j = it_per_frame.point;
                         ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                                                                           it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                        ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f_td, loss_function,
+                        ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f_td, loss_function_chosen,
                                                                                         vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]},
                                                                                         vector<int>{0, 3});
                         marginalization_info->addResidualBlockInfo(residual_block_info);
@@ -1207,7 +1581,7 @@ void Estimator::optimization()
                         {
                             ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                           it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
+                            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function_chosen,
                                                                                            vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
                                                                                            vector<int>{0, 4});
                             marginalization_info->addResidualBlockInfo(residual_block_info);
@@ -1216,7 +1590,7 @@ void Estimator::optimization()
                         {
                             ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                           it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
+                            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function_chosen,
                                                                                            vector<double *>{para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
                                                                                            vector<int>{2});
                             marginalization_info->addResidualBlockInfo(residual_block_info);
@@ -1322,7 +1696,7 @@ void Estimator::optimization()
             
         }
     }
-    //printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
+    // printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
     //printf("whole time for ceres: %f \n", t_whole.toc());
 }
 
@@ -1492,7 +1866,7 @@ void Estimator::predictPtsInNextFrame()
             }
         }
     }
-    featureTracker.setPrediction(predictPts);
+    featureTracker->setPrediction(predictPts);
     //printf("estimator output %d predict pts\n",(int)predictPts.size());
 }
 

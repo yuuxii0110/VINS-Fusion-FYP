@@ -21,6 +21,7 @@ using namespace Eigen;
 
 #include <ros/console.h>
 #include <ros/assert.h>
+#include <ros/ros.h>
 
 #include "parameters.h"
 #include "../utility/tic_toc.h"
@@ -67,7 +68,8 @@ class FeaturePerId
     int used_num;
     double estimated_depth;
     int solve_flag; // 0 haven't solve yet; 1 solve succ; 2 solve fail;
-
+    bool is_ground=false;
+    
     FeaturePerId(int _feature_id, int _start_frame)
         : feature_id(_feature_id), start_frame(_start_frame),
           used_num(0), estimated_depth(-1.0), solve_flag(0)
@@ -96,17 +98,29 @@ class FeatureManager
     void triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
                             Eigen::Vector2d &point0, Eigen::Vector2d &point1, Eigen::Vector3d &point_3d);
     void initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[]);
+    void groundFeatureAssignment(int frameCnt, map<int, bool> ground_indicators);
     bool solvePoseByPnP(Eigen::Matrix3d &R_initial, Eigen::Vector3d &P_initial, 
-                            vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D);
+                            vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D, std::vector<bool> ground_features);
     void removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3d marg_P, Eigen::Matrix3d new_R, Eigen::Vector3d new_P);
     void removeBack();
     void removeFront(int frame_count);
     void removeOutlier(set<int> &outlierIndex);
+    bool customPnPRansac(vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D,vector<bool> ground_features, cv::Mat K, cv::Mat D, cv::Mat bestT, cv::Mat bestR);
+    void setGroundPlane(double a, double b, double c, Eigen::Vector3d origin);
+    double projectPointOntoGround(Eigen::Vector3d &vector_origin, Eigen::Vector3d &point, Eigen::Vector3d &projected);
+    // void projectFeaturesOntoGround(int frameCnt, Vector3d tic[], Matrix3d ric[]);
+    void groundFeatureAlignment(Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], std::set<int> &rejectGroundIds, double threshold=0.5);
     list<FeaturePerId> feature;
     int last_track_num;
     double last_average_parallax;
     int new_feature_num;
     int long_track_num;
+
+    bool ground_plane_initialized=false;
+    bool ground_features_fit_plane=false;
+    bool ground_features_refinement=false;
+    Eigen::Vector3d plane_vec;
+    Eigen::Vector3d plane_origin;
 
   private:
     double compensatedParallax2(const FeaturePerId &it_per_id, int frame_count);

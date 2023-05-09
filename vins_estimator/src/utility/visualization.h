@@ -17,6 +17,8 @@
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/image_encodings.h>
+#include <geometry_msgs/PolygonStamped.h>
+#include <geometry_msgs/Polygon.h>
 #include <cv_bridge/cv_bridge.h>
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
@@ -64,3 +66,9 @@ void pubKeyframe(const Estimator &estimator);
 void pubRelocalization(const Estimator &estimator);
 
 void pubCar(const Estimator & estimator, const std_msgs::Header &header);
+
+void pubSegmentedImage(const cv::Mat &imgTrack, const double t);
+
+void pubGroundPlane(std::vector<std::vector<double>> points);
+
+void pubRefineFeature(Eigen::Vector3d pt);

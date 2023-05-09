@@ -227,20 +227,20 @@ int main(int argc, char **argv)
     ros::NodeHandle n("~");
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
 
-    if(argc != 2)
-    {
-        printf("please intput: rosrun vins vins_node [config file] \n"
-               "for example: rosrun vins vins_node "
-               "~/catkin_ws/src/VINS-Fusion/config/euroc/euroc_stereo_imu_config.yaml \n");
-        return 1;
-    }
+    // if(argc != 2)
+    // {
+    //     printf("please intput: rosrun vins vins_node [config file] \n"
+    //            "for example: rosrun vins vins_node "
+    //            "~/catkin_ws/src/VINS-Fusion/config/euroc/euroc_stereo_imu_config.yaml \n");
+    //     return 1;
+    // }
 
     string config_file = argv[1];
     printf("config_file: %s\n", argv[1]);
+    
 
     readParameters(config_file);
     estimator.setParameter();
-
 #ifdef EIGEN_DONT_PARALLELIZE
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
@@ -258,6 +258,18 @@ int main(int argc, char **argv)
     ros::Subscriber sub_cam_switch = n.subscribe("/vins_cam_switch", 100, cam_switch_callback);
 
     std::thread sync_thread{sync_process};
+    GROUND_WEIGHTAGE = std::stof(argv[2]);
+    int refinement = -1;
+    if(argc > 3){
+        refinement = std::stoi(argv[3]);
+        estimator.setDataFileName(GROUND_WEIGHTAGE,refinement);
+    }
+    else{
+        estimator.setDataFileName(GROUND_WEIGHTAGE);
+    }
+    std::cout << "selected weight: " << GROUND_WEIGHTAGE << "\n";
+    std::cout << "selected refinemet: " << refinement << "\n";
+
     ros::spin();
 
     return 0;

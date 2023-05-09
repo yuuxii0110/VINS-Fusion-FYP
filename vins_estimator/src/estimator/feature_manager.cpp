@@ -48,6 +48,15 @@ int FeatureManager::getFeatureCount()
     return cnt;
 }
 
+void FeatureManager::setGroundPlane(double a, double b, double c, Eigen::Vector3d origin)
+{
+    double norm = std::sqrt(std::pow(a,2)+std::pow(b,2)+std::pow(c,2));
+    double ground_a = a/norm;
+    double ground_b = b/norm;
+    double ground_c = c/norm;
+    plane_vec = {ground_a, ground_b, ground_c};
+    plane_origin = origin;
+}
 
 bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double td)
 {
@@ -194,6 +203,29 @@ VectorXd FeatureManager::getDepthVector()
     return dep_vec;
 }
 
+void FeatureManager::groundFeatureAssignment(int frameCnt, map<int, bool> ground_indicators){
+    for (auto &it_per_id : feature)
+    {
+        if (it_per_id.estimated_depth > 0)
+        {
+            int index = frameCnt - it_per_id.start_frame;
+            if((int)it_per_id.feature_per_frame.size() >= index + 1)
+            {
+                it_per_id.is_ground = ground_indicators[it_per_id.feature_id];
+            }
+        }
+    }
+}
+
+double FeatureManager::projectPointOntoGround(Eigen::Vector3d &vector_origin, Eigen::Vector3d &point, Eigen::Vector3d &projected)
+{
+    Eigen::Vector3d ray_cast = (point - vector_origin).normalized();
+    double t_numerator = (plane_vec.transpose() * (plane_origin - vector_origin))(0);
+    double t_denominator = (plane_vec.transpose() * ray_cast)(0);
+    double t = t_numerator/t_denominator;
+    projected = vector_origin + t*ray_cast;
+    return t;
+}
 
 void FeatureManager::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
                         Eigen::Vector2d &point0, Eigen::Vector2d &point1, Eigen::Vector3d &point_3d)
@@ -211,9 +243,73 @@ void FeatureManager::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen:
     point_3d(2) = triangulated_point(2) / triangulated_point(3);
 }
 
+bool FeatureManager::customPnPRansac(vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D,vector<bool> ground_features, cv::Mat K, cv::Mat D, cv::Mat bestT, cv::Mat bestR)
+{
+    ros::Time begin = ros::Time::now();
+    std::vector<float> weightage_allocated;
+    int s = ground_features.size();
+    double total_weight=0.0;
+    for(bool el:ground_features){
+        float unit_weight = 1.0;
+        if (el){
+            unit_weight = unit_weight*GROUND_WEIGHTAGE;
+        }
+        total_weight += unit_weight;
+        weightage_allocated.push_back(unit_weight);
+    }
+
+    std::set<int> indexes;
+    std::vector<cv::Point2f> sub_pts2D;
+    std::vector<cv::Point3f> sub_pts3D;
+    cv::Mat rvec = bestR.clone();
+    cv::Mat t = bestT.clone();
+    float max_score = 0.0;
+
+    for(int i=0; i< PNP_ITER; i++){
+        indexes.clear();
+        sub_pts2D.clear();
+        sub_pts3D.clear();
+
+        while(indexes.size() < 4){
+            indexes.insert(rand()%s);
+        }
+        
+        for(int el: indexes){
+            sub_pts2D.push_back(pts2D[el]);
+            sub_pts3D.push_back(pts3D[el]);
+        }
+        cv::solvePnP(sub_pts3D, sub_pts2D, K, D,rvec, t, 1);
+
+        //get inliers
+        std::vector<cv::Point2f> reprojected_points;
+        cv::projectPoints(pts3D, rvec, t, K, D,reprojected_points);
+        float score=0.0;
+        for(unsigned long i=0; i<pts2D.size(); i++){
+            float reproj_err = cv::norm(sub_pts2D[i] - reprojected_points[i]);
+            if (reproj_err < F_THRESHOLD){
+                score += weightage_allocated[i]/total_weight;
+            }
+        }
+
+        if (score > max_score){
+            max_score = score;
+            bestR = rvec.clone();
+            bestT = t.clone();
+        }
+        if(max_score > 0.9){
+            break;
+        }
+    }
+
+    std::cout << " pnp ransac score: " << max_score << " time taken: " << (ros::Time::now() - begin).toSec() << "\n";
+    if(max_score > MIN_SCORE_TO_PASS){
+        return true;
+    }
+    return false;
+}
 
 bool FeatureManager::solvePoseByPnP(Eigen::Matrix3d &R, Eigen::Vector3d &P, 
-                                      vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D)
+                                      vector<cv::Point2f> &pts2D, vector<cv::Point3f> &pts3D, vector<bool> ground_features)
 {
     Eigen::Matrix3d R_initial;
     Eigen::Vector3d P_initial;
@@ -234,14 +330,17 @@ bool FeatureManager::solvePoseByPnP(Eigen::Matrix3d &R, Eigen::Vector3d &P,
     cv::eigen2cv(P_initial, t);
     cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);  
     bool pnp_succ;
-    pnp_succ = cv::solvePnP(pts3D, pts2D, K, D, rvec, t, 1);
-    //pnp_succ = solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 8.0 / focalLength, 0.99, inliers);
+    //pnp_succ = cv::solvePnP(pts3D, pts2D, K, D, rvec, t, 1);
+    cv::Mat outR, outT;
+    pnp_succ = customPnPRansac(pts2D, pts3D, ground_features, K, D, t, rvec);
 
+    //pnp_succ = solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 8.0 / focalLength, 0.99, inliers);
     if(!pnp_succ)
     {
         printf("pnp failed ! \n");
         return false;
     }
+
     cv::Rodrigues(rvec, r);
     //cout << "r " << endl << r << endl;
     Eigen::MatrixXd R_pnp;
@@ -256,37 +355,68 @@ bool FeatureManager::solvePoseByPnP(Eigen::Matrix3d &R, Eigen::Vector3d &P,
     return true;
 }
 
+void FeatureManager::groundFeatureAlignment(Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], set<int> &rejectGroundIds, double threshold){
+    rejectGroundIds.clear();
+    if(ground_features_refinement && ground_plane_initialized){
+        for (auto &it_per_id : feature)
+        {
+            if (it_per_id.is_ground && it_per_id.estimated_depth > 0)
+            {
+                Vector3d ptsInCam = ric[0] * (it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth) + tic[0];
+                Vector3d ptsInWorld = Rs[it_per_id.start_frame] * ptsInCam + Ps[it_per_id.start_frame];
+                Vector3d refined_ptsInWorld, refined_ptsInCam;
+                Eigen::Vector3d leftPoseWorld = Ps[it_per_id.start_frame] + Rs[it_per_id.start_frame] * tic[0];
+                double projection_dist = projectPointOntoGround(leftPoseWorld, ptsInWorld, refined_ptsInWorld);
+                double originaldist = (leftPoseWorld - ptsInWorld).norm();
+            
+                if(projection_dist > 0 && std::abs(originaldist - projection_dist) < threshold){
+                    double a = originaldist;
+                    double a_prime = projection_dist;
+                    double refine_depth = it_per_id.estimated_depth*(a_prime/a);
+                    refine_depth =  (refine_depth+it_per_id.estimated_depth)/2;
+                    it_per_id.estimated_depth = refine_depth;
+                }
+                else{
+                    std::cout << "reject!! " << projection_dist << std::endl;
+                    it_per_id.is_ground = false;
+                    rejectGroundIds.insert(it_per_id.feature_id);
+                }
+            }
+        }
+    }
+}
+
 void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[])
 {
-
     if(frameCnt > 0)
     {
         vector<cv::Point2f> pts2D;
         vector<cv::Point3f> pts3D;
+        vector<bool> ground_features;
         for (auto &it_per_id : feature)
         {
             if (it_per_id.estimated_depth > 0)
             {
                 int index = frameCnt - it_per_id.start_frame;
                 if((int)it_per_id.feature_per_frame.size() >= index + 1)
-                {
+                {   
                     Vector3d ptsInCam = ric[0] * (it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth) + tic[0];
                     Vector3d ptsInWorld = Rs[it_per_id.start_frame] * ptsInCam + Ps[it_per_id.start_frame];
-
                     cv::Point3f point3d(ptsInWorld.x(), ptsInWorld.y(), ptsInWorld.z());
                     cv::Point2f point2d(it_per_id.feature_per_frame[index].point.x(), it_per_id.feature_per_frame[index].point.y());
                     pts3D.push_back(point3d);
-                    pts2D.push_back(point2d); 
+                    pts2D.push_back(point2d);
+                    ground_features.push_back(it_per_id.is_ground);
                 }
             }
         }
         Eigen::Matrix3d RCam;
         Eigen::Vector3d PCam;
-        // trans to w_T_cam
+        // trans tant testo w_T_cam
         RCam = Rs[frameCnt - 1] * ric[0];
         PCam = Rs[frameCnt - 1] * tic[0] + Ps[frameCnt - 1];
 
-        if(solvePoseByPnP(RCam, PCam, pts2D, pts3D))
+        if(solvePoseByPnP(RCam, PCam, pts2D, pts3D, ground_features))
         {
             // trans to w_T_imu
             Rs[frameCnt] = RCam * ric[0].transpose(); 
@@ -315,7 +445,6 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             leftPose.leftCols<3>() = R0.transpose();
             leftPose.rightCols<1>() = -R0.transpose() * t0;
             //cout << "left pose " << leftPose << endl;
-
             Eigen::Matrix<double, 3, 4> rightPose;
             Eigen::Vector3d t1 = Ps[imu_i] + Rs[imu_i] * tic[1];
             Eigen::Matrix3d R1 = Rs[imu_i] * ric[1];
@@ -380,6 +509,11 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             */
             continue;
         }
+
+        // if(it_per_id.is_ground){
+        //     // it_per_id.estimated_depth = ...
+        // }
+
         it_per_id.used_num = it_per_id.feature_per_frame.size();
         if (it_per_id.used_num < 4)
             continue;

@@ -20,6 +20,10 @@
 #include <eigen3/Eigen/Dense>
 #include <eigen3/Eigen/Geometry>
 
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <boost/filesystem.hpp>
+
 #include "parameters.h"
 #include "feature_manager.h"
 #include "../utility/utility.h"
@@ -36,6 +40,14 @@
 #include "../factor/projectionOneFrameTwoCamFactor.h"
 #include "../featureTracker/feature_tracker.h"
 
+#include "unet_inference.hpp"
+#include "../custom_lossfunction/custom_lossfunc.hpp"
+
+#include "vins2ground.hpp"
+#include "cam2world.hpp"
+#include "ground_feature_fitter.hpp"
+#include "fuzzy.hpp"
+#include "moving_average.hpp"
 
 class Estimator
 {
@@ -50,7 +62,7 @@ class Estimator
     void inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame);
     void inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     void processIMU(double t, double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header);
+    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header, const map<int, bool> ground_indicators);
     void processMeasurements();
     void changeSensorType(int use_imu, int use_stereo);
 
@@ -79,7 +91,9 @@ class Estimator
     void fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity);
     bool IMUAvailable(double t);
     void initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVector);
-
+    void publishGroundPlane();
+    void refineGroundPlane();
+    void setDataFileName(float weight, int refinement=-1);
     enum SolverFlag
     {
         INITIAL,
@@ -98,13 +112,14 @@ class Estimator
     queue<pair<double, Eigen::Vector3d>> accBuf;
     queue<pair<double, Eigen::Vector3d>> gyrBuf;
     queue<pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > > featureBuf;
+    queue<map<int, bool>> feature_indicators_maps;
     double prevTime, curTime;
     bool openExEstimation;
 
     std::thread trackThread;
     std::thread processThread;
 
-    FeatureTracker featureTracker;
+    FeatureTracker *featureTracker;
 
     SolverFlag solver_flag;
     MarginalizationFlag  marginalization_flag;
@@ -174,4 +189,38 @@ class Estimator
 
     bool initFirstPoseFlag;
     bool initThreadFlag;
+
+    int segmentation_count=0;
+    cv::Mat segmentation_mask;
+    UnetInferece *unetModel;
+    std::vector<uint8_t> colors{0,255};
+
+    int num_ground_plane_calc = 0;
+    int max_ground_plane_calc = 100;
+    int calibrate_via_arucos = 0;
+    int ground_features_refinement = 0;
+    double vins_ground_a, vins_ground_b, vins_ground_c, vins_ground_d;
+    bool set_groundplane_static = false;
+
+    cam2world *cam2world_tf_calculator;
+    vins2world vins2world_tf_calculator;
+    GroundPlaneFitter *fitter;
+
+    cv::Mat distortion_coef, intrinsics_coef;
+    queue<Eigen::Matrix4d> camworld_poses;
+    std::vector<std::vector<float>> history_ground_planes_vec;
+    std::vector<float> history_ground_planes_d;
+    std::string package_path;
+    double current_speed_=0.0;
+    double sampling_time_=0.5;
+    ros::Time last_sample_time_;
+    Eigen::Vector3d last_pos_;
+
+    FuzzyInferenceSystem weight_adjustor_;
+    MovingAverage speed_MA;
+    std::ofstream datafile1;
+    std::ofstream datafile2;
+    std::ofstream datafile3;
+    int row_num=0;
+    ros::Time start_time;
 };

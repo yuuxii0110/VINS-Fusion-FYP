@@ -9,8 +9,10 @@ evaluate/
 result.txt
 result_global.txt
 result_gps.txt
-0*.txt
-1*.txt
-2*.txt
+*.txt
+*.onnx
 camera_camera_calib.yaml
 camera_chessboard_data.dat
+*.png
+*.jpg
+

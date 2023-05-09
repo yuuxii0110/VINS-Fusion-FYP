@@ -1,0 +1,8 @@
+#ground_plane in vins frame
+
+ground_plane_parameters:
+    usage: 0
+    a: -0.0779983
+    b: -0.00846202
+    c: 0.996918
+    d: 1.13875

@@ -1,0 +1,25 @@
+canny_up: 30
+canny_down: 100
+conf_threshold: 0.95
+use_cuda: 1
+rescale_factor: 0.5
+subtime_verbose: 0
+total_time_verbose: 1
+
+use_canny: 1
+
+model_name: final_unet_retrain.onnx
+#model_name: fyp_unet.onnx
+
+# use_canny: 0
+# model_name: original_unet.onnx
+
+# use_canny: 0
+# model_name: vanilla_unet.onnx
+
+auto_play: 1
+vis_rest_time_ms: 5
+
+use_svm_filter: 0
+svm_filename: meanSub_GroundFeatureClassifier.onnx
+

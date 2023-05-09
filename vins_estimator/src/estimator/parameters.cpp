@@ -46,6 +46,17 @@ double F_THRESHOLD;
 int SHOW_TRACK;
 int FLOW_BACK;
 
+int GROUND_SEGMENTATION;
+int SEGMENTATION_FRAME_PERIOD;
+int KLT_SEQUENCE_KERNALSIZE=9;
+int KLT_STEREO_KERNALSIZE=21;
+double FEATURE_THRESHOLD=0.08;
+// int CANNY = 0;
+double BOARDER_DROPUP_PERCENT=0.0;
+float GROUND_WEIGHTAGE, MIN_SCORE_TO_PASS;
+int PNP_ITER;
+float FEATURE_MISSTRACK_FILTER;
+int GROUND_FEATURES_REFINEMENT;
 
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
@@ -81,15 +92,25 @@ void readParameters(std::string config_file)
 
     fsSettings["image0_topic"] >> IMAGE0_TOPIC;
     fsSettings["image1_topic"] >> IMAGE1_TOPIC;
+
     MAX_CNT = fsSettings["max_cnt"];
     MIN_DIST = fsSettings["min_dist"];
     F_THRESHOLD = fsSettings["F_threshold"];
     SHOW_TRACK = fsSettings["show_track"];
     FLOW_BACK = fsSettings["flow_back"];
-
+    GROUND_SEGMENTATION = fsSettings["ground_segmentation"];
+    FEATURE_MISSTRACK_FILTER = fsSettings["feature_mistrack_filter"];
+    SEGMENTATION_FRAME_PERIOD = fsSettings["segmentation_frame_period"];
+    KLT_SEQUENCE_KERNALSIZE = fsSettings["klt_sequence_kernalsize"];
+    KLT_STEREO_KERNALSIZE = fsSettings["klt_stereo_kernalsize"];
+    FEATURE_THRESHOLD = fsSettings["feature_threshold"];
     MULTIPLE_THREAD = fsSettings["multiple_thread"];
-
+    BOARDER_DROPUP_PERCENT = fsSettings["boarder_dropup_percent"];
     USE_IMU = fsSettings["imu"];
+    GROUND_WEIGHTAGE = fsSettings["ground_weightage"];
+    MIN_SCORE_TO_PASS = fsSettings["min_score_to_pass"];
+    PNP_ITER = fsSettings["pnp_iter"];
+    GROUND_FEATURES_REFINEMENT = fsSettings["ground_features_refinement"];
     printf("USE_IMU: %d\n", USE_IMU);
     if(USE_IMU)
     {

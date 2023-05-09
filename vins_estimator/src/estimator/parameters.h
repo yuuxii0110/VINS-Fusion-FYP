@@ -63,6 +63,18 @@ extern int MIN_DIST;
 extern double F_THRESHOLD;
 extern int SHOW_TRACK;
 extern int FLOW_BACK;
+extern int GROUND_SEGMENTATION;
+extern int SEGMENTATION_FRAME_PERIOD;
+extern int KLT_SEQUENCE_KERNALSIZE;
+extern int KLT_STEREO_KERNALSIZE;
+extern double FEATURE_THRESHOLD;
+// extern int CANNY;
+extern float GROUND_WEIGHTAGE;
+extern double BOARDER_DROPUP_PERCENT;
+extern int PNP_ITER;
+extern float MIN_SCORE_TO_PASS;
+extern float FEATURE_MISSTRACK_FILTER;
+extern int GROUND_FEATURES_REFINEMENT;
 
 void readParameters(std::string config_file);
 

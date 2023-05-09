@@ -207,7 +207,7 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
 
     nav_msgs::Odometry odometry;
     odometry.header = pose_msg->header;
-    odometry.header.frame_id = "world";
+    odometry.header.frame_id = "vins";
     odometry.pose.pose.position.x = vio_t.x();
     odometry.pose.pose.position.y = vio_t.y();
     odometry.pose.pose.position.z = vio_t.z();
@@ -412,7 +412,7 @@ int main(int argc, char **argv)
     {
         printf("please intput: rosrun loop_fusion loop_fusion_node [config file] \n"
                "for example: rosrun loop_fusion loop_fusion_node "
-               "/home/tony-ws1/catkin_ws/src/VINS-Fusion/config/euroc/euroc_stereo_imu_config.yaml \n");
+               "/home/tony-ws1/catkin_ws/src/VINS-Fusion/config/euroc/euroc_stereo_imu_config.[[[[[[[[]]]]]]]]] \n");
         return 0;
     }
     

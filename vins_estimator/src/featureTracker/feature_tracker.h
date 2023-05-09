@@ -17,6 +17,7 @@
 #include <execinfo.h>
 #include <csignal>
 #include <opencv2/opencv.hpp>
+#include <opencv2/ml.hpp>
 #include <eigen3/Eigen/Dense>
 
 #include "camodocal/camera_models/CameraFactory.h"
@@ -24,6 +25,7 @@
 #include "camodocal/camera_models/PinholeCamera.h"
 #include "../estimator/parameters.h"
 #include "../utility/tic_toc.h"
+#include "../estimator/svm_inference.hpp"
 
 using namespace std;
 using namespace camodocal;
@@ -32,12 +34,13 @@ using namespace Eigen;
 bool inBorder(const cv::Point2f &pt);
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
+void reduceVector(vector<int> &v, vector<uchar> status);
 
 class FeatureTracker
 {
 public:
-    FeatureTracker();
-    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
+    FeatureTracker(std::string svm_path="", int normalization_flag = 1);
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat(), const cv::Mat &_ground_mask = cv::Mat());
     void setMask();
     void readIntrinsicParameter(const vector<string> &calib_file);
     void showUndistortion(const string &name);
@@ -56,14 +59,29 @@ public:
     void setPrediction(map<int, Eigen::Vector3d> &predictPts);
     double distance(cv::Point2f &pt1, cv::Point2f &pt2);
     void removeOutliers(set<int> &removePtsIds);
+    void falseGroundFeatures(set<int> &rejectGroundIds);
     cv::Mat getTrackImage();
     bool inBorder(const cv::Point2f &pt);
+    bool isGroundFeature(const cv::Point2f &pt);
+    float getFeatureScore(int x, int y);
+    void calcFeaturesScoreStatistic(vector<float> &feature_scores);
+    int InferSvm(int x, int y);
+    int svm_kernal_size = 11;
+    vector<uchar> filterFeature(vector<float> &feature_scores);
+
+    SvmInference *svm_;
 
     int row, col;
+    
     cv::Mat imTrack;
     cv::Mat mask;
     cv::Mat fisheye_mask;
     cv::Mat prev_img, cur_img;
+    cv::Mat segmented_ground;
+    cv::Mat preset_mask;
+    cv::Ptr<cv::ml::SVM> svm;
+
+    vector<bool> ground_feature_indicators;
     vector<cv::Point2f> n_pts;
     vector<cv::Point2f> predict_pts;
     vector<cv::Point2f> predict_pts_debug;
@@ -72,13 +90,20 @@ public:
     vector<cv::Point2f> pts_velocity, right_pts_velocity;
     vector<int> ids, ids_right;
     vector<int> track_cnt;
+    map<int, bool> featureids_isground;
     map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map;
     map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map;
     map<int, cv::Point2f> prevLeftPtsMap;
     vector<camodocal::CameraPtr> m_camera;
     double cur_time;
     double prev_time;
+    float featuresSD = 0.5;
+    float featuresMean = 0.0;
+    float featureMaxScore = 0.0;
     bool stereo_cam;
     int n_id;
     bool hasPrediction;
+    bool preset_mask_set=false;
+    bool checked_ground;
+    bool svm_model_loaded =false;
 };
